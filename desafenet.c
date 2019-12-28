@@ -34,6 +34,7 @@ safe_info verify_esafe_header(FILE* file);
 bool recover_key(FILE* plaintext, FILE* ciphertext, uint8_t* key);
 void esafe_crypt(uint8_t* data, const uint8_t* key, uint16_t len);
 bool esafe_decompress(uint8_t* data, uint16_t size);
+bool esafe_compress(uint8_t* data, uint16_t size, lzo_uintp out_len);
 const char *esafe_mode_to_str(uint8_t mode);
 
 static unsigned int verbosity = 0;
@@ -186,8 +187,54 @@ int main(int argc, char *argv[])
     }
     else if(plaintext && keyfile)
     {
-        fprintf(stderr, "%s: encryption currently unsupported\n", APPNAME);
-        goto err_abort;
+        uint8_t key[ESAFE_BLOCK];
+        uint8_t data[ESAFE_BLOCK];
+        size_t read;
+        lzo_uint out_len = ESAFE_BLOCK;
+
+        fseek(keyfile, 0, SEEK_SET);
+        if(fread(key, 1, ESAFE_BLOCK, keyfile) != sizeof(key))
+        {
+            fprintf(stderr, "%s: %s: invalid keyfile\n", APPNAME, keyfile_str);
+            goto err_abort;
+        }
+
+        fseek(plaintext, 0, SEEK_SET);
+        read = fread(data, 1, sizeof(data), plaintext);
+        bool status = esafe_compress(data, read, &out_len);
+        if(!status)
+        {
+            fprintf(stderr, "%s: error compressing the data\n", APPNAME);
+            fwrite(data, sizeof(uint8_t), read, stdout);
+            goto err_abort;
+        }
+
+        uint8_t head[ESAFE_BLOCK] = {
+        0x62, 0x14, 0x23, 0x65, 256 - out_len & 0xff, 1 - (out_len >> 8), out_len & 0xff, out_len >> 8,
+        0x00, 0x00, 0x00, 0x01, 0x45, 0x2D, 0x53, 0x61,
+        0x66, 0x65, 0x4E, 0x65, 0x74, 0x00, 0x00, 0x00,
+        0x4C, 0x4F, 0x43, 0x4B, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xD3, 0x30, 0x9C, 0x50, 0xFF, 0xBB, 0xF1, 0x23,
+        0x8A, 0x06, 0x1E, 0x67, 0x57, 0x6E, 0x92, 0x6D};
+        memcpy(data, head, ESAFE_BLOCK - out_len);
+
+        esafe_crypt(&data[ESAFE_BLOCK - out_len], key, out_len);
+
+        fwrite(data, sizeof(uint8_t), ESAFE_BLOCK, stdout);
+
+        fseek(plaintext, ESAFE_BLOCK * 1, SEEK_SET);
+        while(true)
+        {
+            read = fread(data, 1, sizeof(data), plaintext);
+
+            esafe_crypt(data, key, read);
+
+            fwrite(data, sizeof(uint8_t), read, stdout);
+
+            if(!read || feof(plaintext))
+                break;
+        }
     }
 
     return 0;
@@ -216,13 +263,29 @@ bool esafe_decompress(uint8_t* data, uint16_t size)
     uint8_t buff[ESAFE_BLOCK] = {0};
     int res = lzo1x_decompress_safe(data, size, buff, &out_len, NULL);
 
-    if(verbosity > 1)
-        fprintf(stderr, "res: %d siz: %d\n", res, size);
+    if(verbosity > 0)
+        fprintf(stderr, "res: %d siz: %lu\n", res, out_len);
 
     if(res != LZO_E_OK)
         return false;
 
     memcpy(data, buff, sizeof(buff));
+    return true;
+}
+
+bool esafe_compress(uint8_t* data, uint16_t size, lzo_uintp out_len)
+{
+    uint8_t buff[ESAFE_BLOCK] = {0};
+    uint8_t wrkmem[LZO1X_1_MEM_COMPRESS] = {0};
+    int res = lzo1x_1_compress(data, size, buff, out_len, wrkmem);
+
+    if(verbosity > 0)
+        fprintf(stderr, "res: %d siz: %lu\n", res, *out_len);
+
+    if(res != LZO_E_OK)
+        return false;
+
+    memcpy(&data[ESAFE_BLOCK - *out_len], buff, *out_len);
     return true;
 }
 
